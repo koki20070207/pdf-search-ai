@@ -47,8 +47,8 @@ def register_pdf(uploaded_file, model, collection):
     #upsertで重複防止
     collection.upsert(embeddings=embeddings, documents=documents, metadatas=metadatas, ids=ids)
 
-#回答
-def generate_rag_response(prompt, model, collection):
+#回答（chat_historyを追加）
+def generate_rag_response(prompt, chat_history, model, collection):
     """Geminiに回答を作らせる"""
     query_vector = model.encode(prompt).tolist()
     results = collection.query(query_embeddings=[query_vector], n_results=1)
@@ -58,11 +58,18 @@ def generate_rag_response(prompt, model, collection):
         parent_context = results["metadatas"][0][0]["parent_text"]
         child_context = results["documents"][0][0]
         
+        #会話履歴をテキストに（3往復分）
+        history_text = ""
+        for msg in chat_history[-6:]:
+            role = "ユーザー" if msg["role"] == "user" else "AI"
+            history_text += f"{role}: {msg['content']}\n"
+        
         llm = genai.GenerativeModel('gemini-2.5-flash')
-        # 親をGeminiに渡す
+        # 親と履歴をGeminiに渡す
         response = llm.generate_content(
-            f"以下の【参考資料】に基づいて【質問】に答えてください。\n"
-            f"【参考資料】\n{parent_context}\n"
+            f"以下の【過去の会話履歴】と【参考資料】に基づいて【質問】に答えてください。\n\n"
+            f"【過去の会話履歴】\n{history_text if history_text else 'なし'}\n"
+            f"【参考資料】\n{parent_context}\n\n"
             f"【質問】\n{prompt}"
         )
         return response.text, child_context, parent_context
@@ -104,10 +111,15 @@ def main():
         with st.chat_message("assistant"):
             with st.status("検索中...", expanded=True) as status:
                 st.write("回答を作成しています...")
-
-        with st.chat_message("assistant"):
-            # 検索・生成関数を呼び出す
-            answer, child, parent = generate_rag_response(prompt, model, collection)
+                
+                #今回の質問より「1つ前までの履歴」をAIに渡す
+                history_for_ai = st.session_state.messages[:-1]
+                
+                # 検索・生成関数を呼び出す
+                answer, child, parent = generate_rag_response(prompt, history_for_ai, model, collection)
+                
+                status.update(label="完了", state="complete", expanded=False)
+            
             st.markdown(answer)
             
             #アコーディオン
