@@ -1,4 +1,5 @@
 import os
+import base64
 import streamlit as st
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -47,7 +48,7 @@ def register_pdf(uploaded_file, model, collection):
     #upsertで重複防止
     collection.upsert(embeddings=embeddings, documents=documents, metadatas=metadatas, ids=ids)
 
-#回答（chat_historyを追加）
+#回答（chat_history あり）
 def generate_rag_response(prompt, chat_history, model, collection):
     """Geminiに回答を作らせる"""
     query_vector = model.encode(prompt).tolist()
@@ -58,7 +59,7 @@ def generate_rag_response(prompt, chat_history, model, collection):
         parent_context = results["metadatas"][0][0]["parent_text"]
         child_context = results["documents"][0][0]
         
-        #会話履歴をテキストに（3往復分）
+        # 過去の会話履歴をテキストにまとめる（3往復分）
         history_text = ""
         for msg in chat_history[-6:]:
             role = "ユーザー" if msg["role"] == "user" else "AI"
@@ -80,12 +81,13 @@ def generate_rag_response(prompt, chat_history, model, collection):
 #UI
 def main():
     """Streamlitの画面描画とユーザー操作の受付"""
+    # 画面を広く使う設定
     st.set_page_config(page_title="PDF AIチャット", layout="wide")
     st.title("PDF AIチャット")
     
     model, collection = init_system()
     
-    #ファイルアップロード
+    #ファイルアップロードと設定
     with st.sidebar:
         st.header("📁 資料追加")
         uploaded_file = st.file_uploader("PDFを選択", type=["pdf"])
@@ -93,42 +95,66 @@ def main():
             with st.spinner("登録中..."):
                 register_pdf(uploaded_file, model, collection)
                 st.success(f"「{uploaded_file.name}」を登録しました。")
-
-    #履歴
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    #入力時の処理
-    if prompt := st.chat_input("質問を入力してください"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
         
-        with st.chat_message("assistant"):
-            with st.status("検索中...", expanded=True) as status:
-                st.write("回答を作成しています...")
-                
-                #今回の質問より「1つ前までの履歴」をAIに渡す
-                history_for_ai = st.session_state.messages[:-1]
-                
-                # 検索・生成関数を呼び出す
-                answer, child, parent = generate_rag_response(prompt, history_for_ai, model, collection)
-                
-                status.update(label="完了", state="complete", expanded=False)
-            
-            st.markdown(answer)
-            
-            #アコーディオン
-            if parent:
-                with st.expander("内部データを確認"):
-                    st.write("**ヒットしたチャンク:**", child)
-                    st.write("**AIへ渡したチャンク:**", parent)
+        st.divider()
+        st.header("⚙️ 設定")
+        # ★ プレビューのON/OFFトグルを追加
+        show_preview = st.toggle("📄 PDFプレビューを表示", value=False)
+
+    #画面分割
+    if show_preview and uploaded_file:
+        preview_col, chat_col = st.columns([1, 1]) # 画面を1:1に分割
         
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        # 左側：PDFプレビュー画面
+        with preview_col:
+            st.markdown(f"**プレビュー:** {uploaded_file.name}")
+            bytes_data = uploaded_file.getvalue()
+            base64_pdf = base64.b64encode(bytes_data).decode('utf-8')
+            # iframeを使ってPDFを表示
+            pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="700" type="application/pdf"></iframe>'
+            st.markdown(pdf_display, unsafe_allow_html=True)
+            
+        # 右側：チャット画面（chat_colをコンテナとして使う）
+        chat_container = chat_col
+    else:
+        # プレビューOFF時（または未アップロード時）は画面全体をチャットに使う
+        chat_container = st.container()
+
+    # 以降のチャット画面は chat_container の中に配置する
+    with chat_container:
+        #履歴
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        #入力時の処理
+        if prompt := st.chat_input("質問を入力してください"):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            with st.chat_message("assistant"):
+                with st.status("検索中...", expanded=True) as status:
+                    st.write("回答を作成しています...")
+                    
+                    history_for_ai = st.session_state.messages[:-1]
+                    
+                    answer, child, parent = generate_rag_response(prompt, history_for_ai, model, collection)
+                    
+                    status.update(label="完了", state="complete", expanded=False)
+                
+                st.markdown(answer)
+                
+                #アコーディオン
+                if parent:
+                    with st.expander("内部データを確認"):
+                        st.write("**ヒットしたチャンク:**", child)
+                        st.write("**AIへ渡したチャンク:**", parent)
+            
+            st.session_state.messages.append({"role": "assistant", "content": answer})
 
 #開始地点
 if __name__ == "__main__":
