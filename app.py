@@ -2,6 +2,7 @@ import os
 import base64
 import streamlit as st
 import chromadb
+import time
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -14,8 +15,13 @@ def init_system():
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     model = SentenceTransformer('intfloat/multilingual-e5-small')
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    collection = chroma_client.get_or_create_collection(name="modular_rag_db")
-    return model, collection
+    
+    #PDF棚
+    pdf_collection = chroma_client.get_or_create_collection(name="modular_rag_db")
+    #長期記憶棚
+    chat_collection = chroma_client.get_or_create_collection(name="chat_memory_db")
+    
+    return model, pdf_collection, chat_collection
 
 #分割
 def create_hierarchical_chunks(text, parent_size=1000, child_size=200):
@@ -48,36 +54,79 @@ def register_pdf(uploaded_file, model, collection):
     #upsertで重複防止
     collection.upsert(embeddings=embeddings, documents=documents, metadatas=metadatas, ids=ids)
 
-#回答（chat_history あり）
-def generate_rag_response(prompt, chat_history, model, collection):
-    """Geminiに回答を作らせる"""
-    query_vector = model.encode(prompt).tolist()
-    results = collection.query(query_embeddings=[query_vector], n_results=1)
+def register_chat_memory(prompt, answer, model, chat_collection):
+    """会話履歴を保存"""
+    #親データ
+    conversation_context = f"ユーザー: {prompt}\nAI: {answer}"
     
-    #if hit
-    if results["metadatas"] and len(results["metadatas"][0]) > 0:
-        parent_context = results["metadatas"][0][0]["parent_text"]
-        child_context = results["documents"][0][0]
-        
-        # 過去の会話履歴をテキストにまとめる（3往復分）
-        history_text = ""
-        for msg in chat_history[-6:]:
-            role = "ユーザー" if msg["role"] == "user" else "AI"
-            history_text += f"{role}: {msg['content']}\n"
-        
-        llm = genai.GenerativeModel('gemini-2.5-flash')
-        # 親と履歴をGeminiに渡す
-        response = llm.generate_content(
-            f"以下の【過去の会話履歴】と【参考資料】に基づいて【質問】に答えてください。\n\n"
-            f"【過去の会話履歴】\n{history_text if history_text else 'なし'}\n"
-            f"【参考資料】\n{parent_context}\n\n"
-            f"【質問】\n{prompt}"
-        )
-        return response.text, child_context, parent_context
+    #質問を保存
+    q_embedding = model.encode(prompt).tolist()
+    q_id = f"chat_q_{int(time.time_ns())}"
+    chat_collection.upsert(
+        embeddings=[q_embedding],
+        documents=[prompt],
+        metadatas=[{"parent_text": conversation_context, "type": "question"}],
+        ids=[q_id]
+    )
     
-    #else
-    return "資料が見つかりませんでした。", None, None
+    #回答を保存
+    a_embedding = model.encode(answer).tolist()
+    a_id = f"chat_a_{int(time.time_ns())}"
+    chat_collection.upsert(
+        embeddings=[a_embedding],
+        documents=[answer],
+        metadatas=[{"parent_text": conversation_context, "type": "answer"}],
+        ids=[a_id]
+    )
 
+#回答
+def generate_rag_response(prompt, chat_history, model, pdf_collection, chat_collection, threshold):
+    """PDFと長期記憶の両方から検索してGeminiに回答を作らせる"""
+    query_vector = model.encode(prompt).tolist()
+    
+    # 1. PDF本棚から検索
+    pdf_results = pdf_collection.query(query_embeddings=[query_vector], n_results=1)
+    pdf_context = "なし"
+    child_context = "なし"
+    #データがない場合は999にする
+    pdf_score = pdf_results["distances"][0][0] if pdf_results["distances"] and len(pdf_results["distances"][0]) > 0 else 999.0
+    
+    #足切
+    if pdf_score < threshold and pdf_results["metadatas"] and len(pdf_results["metadatas"][0]) > 0:
+        pdf_context = pdf_results["metadatas"][0][0]["parent_text"]
+        child_context = pdf_results["documents"][0][0]
+        
+    #長期記憶棚から検索
+    memory_results = chat_collection.query(query_embeddings=[query_vector], n_results=1)
+    memory_context = "なし"
+
+    mem_score = memory_results["distances"][0][0] if memory_results["distances"] and len(memory_results["distances"][0]) > 0 else 999.0
+    
+    #足切り
+    if mem_score < threshold and memory_results["metadatas"] and len(memory_results["metadatas"][0]) > 0:
+        memory_context = memory_results["metadatas"][0][0]["parent_text"]
+        
+    #直近の会話履歴をまとめる
+    history_text = ""
+    for msg in chat_history[-6:]:
+        role = "ユーザー" if msg["role"] == "user" else "AI"
+        history_text += f"{role}: {msg['content']}\n"
+    
+    #プロンプト
+    llm = genai.GenerativeModel('gemini-2.5-flash')
+    response = llm.generate_content(
+        f"あなたはユーザーの過去の会話をすべて記憶している専属アシスタントです。\n"
+        f"「AIなので個別の情報を記憶できません」といった定型文は絶対に言わないでください。\n"
+        f"以下の【履歴】、【過去の記憶】、【参考資料】のみを参考にして回答してください。\n"
+        f"※ただし、資料や記憶の中に「なし」と書かれている場合は、その情報は存在しないものとして扱い、知ったかぶりをせず会話してください。\n\n"
+        f"【直近の会話履歴】\n{history_text if history_text else 'なし'}\n"
+        f"【過去の長期記憶】\n{memory_context}\n"
+        f"【参考資料（PDF）】\n{pdf_context}\n\n"
+        f"【質問】\n{prompt}"
+    )
+    
+    #6つのデータを返す
+    return response.text, child_context, pdf_context, memory_context, pdf_score, mem_score
 #UI
 def main():
     """Streamlitの画面描画とユーザー操作の受付"""
@@ -85,7 +134,7 @@ def main():
     st.set_page_config(page_title="PDF AIチャット", layout="wide")
     st.title("PDF AIチャット")
     
-    model, collection = init_system()
+    model, collection, chat_collection = init_system()
     
     #ファイルアップロードと設定
     with st.sidebar:
@@ -98,27 +147,41 @@ def main():
         
         st.divider()
         st.header("⚙️ 設定")
-        # ★ プレビューのON/OFFトグルを追加
-        show_preview = st.toggle("📄 PDFプレビューを表示", value=False)
+        threshold_label = st.sidebar.segmented_control(
+            "🔍 検索の厳しさ",
+            options=["厳重 (0.2)", "標準 (0.3)", "緩め (0.5)"],
+            selection_mode="single",
+            default="標準 (0.3)"
+        )
+        if not threshold_label:
+            threshold_label = "標準 (0.3)"
+        threshold_map = {"厳重 (0.2)": 0.2, "標準 (0.3)": 0.3, "緩め (0.5)": 0.5}
+        threshold = threshold_map[threshold_label]
+        #pdf配置設定
+        preview_pos = st.segmented_control(
+            "📄 PDFの表示位置",
+            options=["左", "非表示", "右"],
+            default="非表示" # デフォルトの選択
+            )
 
     #画面分割
-    if show_preview and uploaded_file:
-        preview_col, chat_col = st.columns([1, 1]) # 画面を1:1に分割
+    # 最初は画面全体をチャット用にしておく（デフォルト設定）
+    chat_container = st.container()
+
+    current_pos = preview_pos if preview_pos else "非表示"
+
+    # 表示位置が指定されていて、PDFがある場合だけ画面を割る
+    if current_pos != "非表示" and uploaded_file:
+        col1, col2 = st.columns([1, 1])
+        preview_col, chat_container = (col2, col1) if current_pos == "右" else (col1, col2)
         
-        # 左側：PDFプレビュー画面
+        # PDFプレビュー画面の描画
         with preview_col:
             st.markdown(f"**プレビュー:** {uploaded_file.name}")
             bytes_data = uploaded_file.getvalue()
             base64_pdf = base64.b64encode(bytes_data).decode('utf-8')
-            # iframeを使ってPDFを表示
             pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="700" type="application/pdf"></iframe>'
             st.markdown(pdf_display, unsafe_allow_html=True)
-            
-        # 右側：チャット画面（chat_colをコンテナとして使う）
-        chat_container = chat_col
-    else:
-        # プレビューOFF時（または未アップロード時）は画面全体をチャットに使う
-        chat_container = st.container()
 
     # 以降のチャット画面は chat_container の中に配置する
     with chat_container:
@@ -141,20 +204,26 @@ def main():
                     st.write("回答を作成しています...")
                     
                     history_for_ai = st.session_state.messages[:-1]
-                    
-                    answer, child, parent = generate_rag_response(prompt, history_for_ai, model, collection)
+                
+                    answer, child, parent, mem_context, pdf_score, mem_score = generate_rag_response(
+                        prompt, history_for_ai, model, collection, chat_collection, threshold
+                    )
                     
                     status.update(label="完了", state="complete", expanded=False)
                 
                 st.markdown(answer)
                 
-                #アコーディオン
-                if parent:
-                    with st.expander("内部データを確認"):
-                        st.write("**ヒットしたチャンク:**", child)
-                        st.write("**AIへ渡したチャンク:**", parent)
+                #アコーディオンの中身
+                with st.expander("内部データを確認"):
+                    st.write(f"**長期記憶スコア (距離: {mem_score:.2f} / {threshold}未満で採用):**")
+                    st.write(mem_context)
+                    st.write("---")
+                    st.write(f"**PDFスコア (距離: {pdf_score:.2f} / {threshold}未満で採用):**")
+                    st.write("**ヒットした子:**", child)
+                    st.write("**AIへ渡した親:**", parent)
             
             st.session_state.messages.append({"role": "assistant", "content": answer})
+            register_chat_memory(prompt, answer, model, chat_collection) #会話記憶
 
 #開始地点
 if __name__ == "__main__":
