@@ -127,6 +127,25 @@ def generate_rag_response(prompt, chat_history, model, pdf_collection, chat_coll
     
     #6つのデータを返す
     return response.text, child_context, pdf_context, memory_context, pdf_score, mem_score
+
+def get_all_memories(collection):
+    """ChromaDBからすべての記憶（親テキスト）を取得する"""
+    results = collection.get()
+    
+    # 記憶が空っぽの場合は空のリストを返す
+    if not results or not results["metadatas"]:
+        return []
+    
+    # 重複を排除して、親テキストだけのリストを作成する
+    unique_memories = set()
+    for meta in results["metadatas"]:
+        unique_memories.add(meta["parent_text"])
+    
+    return list(unique_memories)
+
+def delete_memory(collection, parent_text):
+    """指定された親テキストを持つ記憶（QとAの子データ両方）をまとめて削除する"""
+    collection.delete(where={"parent_text": parent_text})
 #UI
 def main():
     """Streamlitの画面描画とユーザー操作の受付"""
@@ -163,6 +182,28 @@ def main():
             options=["左", "非表示", "右"],
             default="非表示" # デフォルトの選択
             )
+        st.divider()
+        
+        #===記憶管理エリア===
+        st.header("📝記憶の管理")
+        
+        # 全ての記憶を取得
+        memories = get_all_memories(chat_collection)
+        
+        if not memories:
+            st.info("現在、保存されている記憶はありません。")
+        else:
+            # 記憶の数だけループして、アコーディオン（開閉メニュー）を作る
+            for mem in memories:
+                # タイトルは長すぎると不恰好なので、最初の15文字だけ表示
+                with st.expander(f"📝 {mem[:15]}..."):
+                    st.write(mem) # 中を開くと全テキストが見える
+                    
+                    # 削除ボタン（※Streamlitの仕様で、ボタンには一意のkeyが必要）
+                    if st.button("🗑️ この記憶を消去", key=f"del_{mem}"):
+                        delete_memory(chat_collection, mem)
+                        st.success("記憶を消去しました！")
+                        st.rerun() # 画面をリフレッシュして最新状態にする
 
     #画面分割
     # 最初は画面全体をチャット用にしておく（デフォルト設定）
